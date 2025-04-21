@@ -1,210 +1,294 @@
-# -*- coding: utf-8 -*-
-"""CNN_week9.ipynb
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torchvision import datasets, transforms
+import matplotlib.pyplot as plt
 
-IST597 :- Implementing CNN from scratch
-Week 9 Tutorial
+###########################
+# Custom Normalization Modules
+###########################
 
-Author:- aam35
-"""
 
-import tensorflow as tf
-import numpy as np
-import time
-import tensorflow.contrib.eager as tfe
-tf.enable_eager_execution()
-tf.executing_eagerly()
-seed = 1234
-tf.random.set_random_seed(seed=seed)
-np.random.seed(seed)
+class BatchNormManual(nn.Module):
+    def __init__(self, num_features, eps=1e-5):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(num_features))
+        self.beta = nn.Parameter(torch.zeros(num_features))
+        self.eps = eps
 
-from tensorflow.examples.tutorials.mnist import input_data
-data = input_data.read_data_sets("/tmp/data/", one_hot=True, reshape=False)
+    def forward(self, x):
+        if x.dim() == 2:
+            m = x.mean(dim=0, keepdim=True)
+            v = x.var(dim=0, unbiased=False, keepdim=True)
+            xh = (x - m) / torch.sqrt(v + self.eps)
+            return self.gamma * xh + self.beta
+        elif x.dim() == 4:
+            m = x.mean(dim=[0, 2, 3], keepdim=True)
+            v = x.var(dim=[0, 2, 3], unbiased=False, keepdim=True)
+            xh = (x - m) / torch.sqrt(v + self.eps)
+            return self.gamma.view(1, -1, 1, 1)*xh + self.beta.view(1, -1, 1, 1)
+        else:
+            raise NotImplementedError
 
-batch_size = 64
-hidden_size = 100
-learning_rate = 0.01
-output_size = 10
 
-class CNN(object):
-  def __init__(self,hidden_size,output_size,device=None):
-      filter_h, filter_w, filter_c , filter_n = 5 ,5 ,1 ,30
-      self.W1 = tf.Variable(tf.random_normal([filter_h, filter_w, filter_c, filter_n], stddev=0.1))
-      self.b1 = tf.Variable(tf.zeros([filter_n]),dtype=tf.float32)
-      self.W2 = tf.Variable(tf.random_normal([14*14*filter_n, hidden_size], stddev=0.1))
-      self.b2 = tf.Variable(tf.zeros([hidden_size]),dtype=tf.float32)
-      self.W3 = tf.Variable(tf.random_normal([hidden_size, output_size], stddev=0.1))
-      self.b3 = tf.Variable(tf.zeros([output_size]),dtype=tf.float32)
-      self.variables = [self.W1,self.b1, self.W2, self.b2, self.W3, self.b3]
-      self.device = device
-      self.size_output = output_size
-  
-  def flatten(self,X, window_h, window_w, window_c, out_h, out_w, stride=1, padding=0):
-    
-      X_padded = tf.pad(X, [[0,0], [padding, padding], [padding, padding], [0,0]])
+class LinearWeightNorm(nn.Module):
+    def __init__(self, in_f, out_f, bias=True):
+        super().__init__()
+        self.v = nn.Parameter(torch.randn(out_f, in_f))
+        self.g = nn.Parameter(torch.ones(out_f))
+        self.bias = nn.Parameter(torch.zeros(out_f)) if bias else None
 
-      windows = []
-      for y in range(out_h):
-          for x in range(out_w):
-              window = tf.slice(X_padded, [0, y*stride, x*stride, 0], [-1, window_h, window_w, -1])
-              windows.append(window)
-      stacked = tf.stack(windows) # shape : [out_h, out_w, n, filter_h, filter_w, c]
+    def forward(self, x):
+        vn = self.v.norm(dim=1, keepdim=True)
+        w = (self.g.unsqueeze(1)/vn) * self.v
+        return F.linear(x, w, self.bias)
 
-      return tf.reshape(stacked, [-1, window_c*window_w*window_h])
-  
-  def convolution(self,X, W, b, padding, stride):
-      n, h, w, c = map(lambda d: d.value, X.get_shape())
-      #print(X.get_shape())
-      #print(data.train.images.get_shape())
-      filter_h, filter_w, filter_c, filter_n = [d.value for d in W.get_shape()]
-    
-      out_h = (h + 2*padding - filter_h)//stride + 1
-      out_w = (w + 2*padding - filter_w)//stride + 1
 
-      X_flat = self.flatten(X, filter_h, filter_w, filter_c, out_h, out_w, stride, padding)
-      W_flat = tf.reshape(W, [filter_h*filter_w*filter_c, filter_n])
-    
-      z = tf.matmul(X_flat, W_flat) + b     # b: 1 X filter_n
-    
-      return tf.transpose(tf.reshape(z, [out_h, out_w, n, filter_n]), [2, 0, 1, 3])
-    
- 
-    
-  def relu(self,X):
-      return tf.maximum(X, tf.zeros_like(X))
-    
-  def max_pool(self,X, pool_h, pool_w, padding, stride):
-      n, h, w, c = [d.value for d in X.get_shape()]
-    
-      out_h = (h + 2*padding - pool_h)//stride + 1
-      out_w = (w + 2*padding - pool_w)//stride + 1
+class LayerNormManual(nn.Module):
+    def __init__(self, features, eps=1e-5):
+        super().__init__()
+        self.gamma = nn.Parameter(torch.ones(features))
+        self.beta = nn.Parameter(torch.zeros(features))
+        self.eps = eps
 
-      X_flat = self.flatten(X, pool_h, pool_w, c, out_h, out_w, stride, padding)
+    def forward(self, x):
+        m = x.mean(dim=1, keepdim=True)
+        v = x.var(dim=1, unbiased=False, keepdim=True)
+        xh = (x - m) / torch.sqrt(v + self.eps)
+        return self.gamma * xh + self.beta
 
-      pool = tf.reduce_max(tf.reshape(X_flat, [out_h, out_w, n, pool_h*pool_w, c]), axis=3)
-      return tf.transpose(pool, [2, 0, 1, 3])
+###########################
+# Model Definitions
+###########################
 
-    
-  def affine(self,X, W, b):
-      n = X.get_shape()[0].value # number of samples
-      X_flat = tf.reshape(X, [n, -1])
-      return tf.matmul(X_flat, W) + b 
-    
-  def softmax(self,X):
-      X_centered = X - tf.reduce_max(X) # to avoid overflow
-      X_exp = tf.exp(X_centered)
-      exp_sum = tf.reduce_sum(X_exp, axis=1)
-      return tf.transpose(tf.transpose(X_exp) / exp_sum) 
-    
-  
-  def cross_entropy_error(self,yhat, y):
-      return -tf.reduce_mean(tf.log(tf.reduce_sum(yhat * y, axis=1)))
-    
-  
-  def forward(self,X):
-      if self.device is not None:
-        with tf.device('gpu:0' if self.device == 'gpu' else 'cpu'):
-          self.y = self.compute_output(X)
-      else:
-        self.y = self.compute_output(X)
-      
-      return self.y
-    
-    
-  def loss(self, y_pred, y_true):
-      '''
-      y_pred - Tensor of shape (batch_size, size_output)
-      y_true - Tensor of shape (batch_size, size_output)
-      '''
-      y_true_tf = tf.cast(tf.reshape(y_true, (-1, self.size_output)), dtype=tf.float32)
-      y_pred_tf = tf.cast(y_pred, dtype=tf.float32)
-      return tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits_v2(logits=y_pred_tf, labels=y_true_tf))
-    
-    
-  def backward(self, X_train, y_train):
-      """
-      backward pass
-      """
-      # optimizer
-      # Test with SGD,Adam, RMSProp
-      optimizer = tf.train.GradientDescentOptimizer(learning_rate=learning_rate)
-      #predicted = self.forward(X_train)
-      #current_loss = self.loss(predicted, y_train)
-      #optimizer.minimize(current_loss, self.variables)
 
-      #optimizer = tf.train.AdamOptimizer(learning_rate=learning_rate)
-      with tf.GradientTape() as tape:
-          predicted = self.forward(X_train)
-          current_loss = self.loss(predicted, y_train)
-      #print(predicted)
-      #print(current_loss)
-      #current_loss_tf = tf.cast(current_loss, dtype=tf.float32)
-      grads = tape.gradient(current_loss, self.variables)
-      optimizer.apply_gradients(zip(grads, self.variables),
-                              global_step=tf.train.get_or_create_global_step())
-      
-      
-  def compute_output(self,X):
-      conv_layer1 = self.convolution(X, self.W1, self.b1, padding=2, stride=1)
-      conv_activation = self.relu(conv_layer1)
-      conv_pool = self.max_pool(conv_activation, pool_h=2, pool_w=2, padding=0, stride=2)
-      conv_affine =self.affine(conv_pool, self.W2,self.b2)
-      conv_affine_activation = self.relu(conv_affine)
-      
-      conv_affine_1 = self.affine(conv_affine_activation, self.W3, self.b3)
-      return conv_affine_1
+class NetBaseline(nn.Module):
+    """Simple MLP with no normalization"""
 
-def accuracy_function(yhat,true_y):
-  correct_prediction = tf.equal(tf.argmax(yhat, 1), tf.argmax(true_y, 1))
-  accuracy = tf.reduce_mean(tf.cast(correct_prediction, tf.float32))
-  return accuracy
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(28*28, 256)
+        self.fc2 = nn.Linear(256, 10)
 
-# Initialize model using GPU
-mlp_on_cpu = CNN(hidden_size,output_size, device='gpu')
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
 
-num_epochs = 4
-train_x =  tf.convert_to_tensor(data.train.images)
-train_y = tf.convert_to_tensor(data.train.labels)
-time_start = time.time()
-num_train = 55000
-z= 0
 
-for epoch in range(num_epochs):
-        train_ds = tf.data.Dataset.from_tensor_slices((data.train.images, data.train.labels)).map(lambda x, y: (x, tf.cast(y, tf.float32)))\
-           .shuffle(buffer_size=1000)\
-           .batch(batch_size=batch_size)
-        loss_total = tf.Variable(0, dtype=tf.float32)
-        accuracy_total = tf.Variable(0, dtype=tf.float32)
-        for inputs, outputs in train_ds:
-            preds = mlp_on_cpu.forward(inputs)
-            loss_total = loss_total + mlp_on_cpu.loss(preds, outputs)
-#             accuracy_train = accuracy_function(preds,outputs)
-#             accuracy_total = accuracy_total + accuracy_train
-            mlp_on_cpu.backward(inputs, outputs)
-            #print(z)
-            #z = z+ 1
-        print('Number of Epoch = {} - loss:= {:.4f}'.format(epoch + 1, loss_total.numpy() / num_train))
-        preds = mlp_on_cpu.compute_output(train_x)
-        accuracy_train = accuracy_function(preds,train_y)
-        
-        accuracy_train = accuracy_train * 100
-        print ("Training Accuracy = {}".format(accuracy_train.numpy()))
-        
-        
-#         preds_val = mlp_on_cpu.compute_output(data.validation.images)
-#         accuracy_val = accuracy_function(preds_val,data.validation.labels)
-#         accuracy_val = accuracy_val * 100
-#         print ("Validation Accuracy = {}".format(accuracy_val.numpy()))
- 
-#test accuracy
-test_x =  tf.convert_to_tensor(data.test.images)
-test_y = tf.convert_to_tensor(data.test.labels)
-preds_test = mlp_on_cpu.compute_output(test_x)
-accuracy_test = accuracy_function(preds_test,test_y)
-# To keep sizes compatible with model
-accuracy_test = accuracy_test * 100
-print ("Test Accuracy = {}".format(accuracy_test.numpy()))
+class NetBN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(28*28, 256)
+        self.bn1 = BatchNormManual(256)
+        self.fc2 = nn.Linear(256, 10)
 
-        
-# time_taken = time.time() - time_start
-# print('\nTotal time taken (in seconds): {:.2f}'.format(time_taken))
-# #For per epoch_time = Total_Time / Number_of_epochs
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.bn1(self.fc1(x)))
+        return self.fc2(x)
+
+
+class NetLN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = nn.Linear(28*28, 256)
+        self.ln1 = LayerNormManual(256)
+        self.fc2 = nn.Linear(256, 10)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.ln1(self.fc1(x)))
+        return self.fc2(x)
+
+
+class NetWN(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.fc1 = LinearWeightNorm(28*28, 256)
+        self.fc2 = nn.Linear(256, 10)
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)
+        x = F.relu(self.fc1(x))
+        return self.fc2(x)
+
+###########################
+# Training & Evaluation
+###########################
+
+
+def train_one_epoch(model, device, loader, optimizer):
+    model.train()
+    loss_sum, gn_sum = 0.0, 0.0
+    for data, target in loader:
+        data, target = data.to(device), target.to(device)
+        optimizer.zero_grad()
+        out = model(data)
+        loss = F.cross_entropy(out, target)
+        loss.backward()
+        if isinstance(model, NetWN):
+            gn = model.fc1.v.grad.norm().item()
+        else:
+            gn = model.fc1.weight.grad.norm().item() if hasattr(
+                model.fc1, 'weight') else model.fc1.weight.grad.norm().item()
+        optimizer.step()
+        loss_sum += loss.item()
+        gn_sum += gn
+    return loss_sum/len(loader), gn_sum/len(loader)
+
+
+def test_model(model, device, loader):
+    model.eval()
+    sum_loss, correct = 0.0, 0
+    with torch.no_grad():
+        for data, target in loader:
+            data, target = data.to(device), target.to(device)
+            out = model(data)
+            sum_loss += F.cross_entropy(out, target, reduction='sum').item()
+            pred = out.argmax(dim=1, keepdim=True)
+            correct += pred.eq(target.view_as(pred)).sum().item()
+    sum_loss /= len(loader.dataset)
+    return sum_loss, correct/len(loader.dataset)
+
+###########################
+# Main Experiment
+###########################
+
+
+def main():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Data loaders
+    transform = transforms.ToTensor()
+    train_loader = torch.utils.data.DataLoader(
+        datasets.FashionMNIST('./data', train=True,
+                              download=True, transform=transform),
+        batch_size=64, shuffle=True)
+    test_loader = torch.utils.data.DataLoader(
+        datasets.FashionMNIST('./data', train=False, transform=transform),
+        batch_size=1000, shuffle=False)
+
+    # Instantiate models & optimizers
+    net_base = NetBaseline().to(device)
+    opt_base = optim.Adam(net_base.parameters(), lr=1e-3)
+
+    net_bn = NetBN().to(device)
+    opt_bn = optim.Adam(net_bn.parameters(), lr=1e-3)
+
+    net_ln = NetLN().to(device)
+    opt_ln = optim.Adam(net_ln.parameters(), lr=1e-3)
+
+    net_wn = NetWN().to(device)
+    opt_wn = optim.Adam(net_wn.parameters(), lr=1e-3)
+
+    models = {
+        'NoNorm':    (net_base, opt_base),
+        'BatchNorm': (net_bn,   opt_bn),
+        'LayerNorm': (net_ln,   opt_ln),
+        'WeightNorm': (net_wn,   opt_wn),
+    }
+
+    # Metrics
+    metrics = {name: {'train_loss': [], 'test_acc': [], 'grad_norm': []}
+               for name in models}
+    epochs = 50
+
+    for ep in range(1, epochs+1):
+        print(f"\n===== Epoch {ep} =====")
+        for name, (model, opt) in models.items():
+            print(f"\n--- {name} ---")
+            tl, gn = train_one_epoch(model, device, train_loader, opt)
+            print(f"Train loss: {tl:.4f}, Avg grad‑norm: {gn:.4f}")
+            test_l, test_a = test_model(model, device, test_loader)
+            print(f"Test  loss: {test_l:.4f}, Acc: {100*test_a:.2f}%")
+            metrics[name]['train_loss'].append(tl)
+            metrics[name]['test_acc'].append(test_a)
+            metrics[name]['grad_norm'].append(gn)
+
+    # Optional: Compare custom BatchNorm with PyTorch's built-in BatchNorm1d on a sample tensor.
+    x_sample = torch.randn(10, 256).to(device)
+    bn_custom = BatchNormManual(256).to(device)
+    bn_builtin = nn.BatchNorm1d(256, eps=1e-5, affine=True).to(device)
+    # Initialize built-in parameters to match the custom BN for a fair comparison.
+    with torch.no_grad():
+        bn_builtin.weight.copy_(bn_custom.gamma)
+        bn_builtin.bias.copy_(bn_custom.beta)
+    out_custom = bn_custom(x_sample)
+    out_builtin = bn_builtin(x_sample)
+    diff = torch.abs(out_custom - out_builtin).mean().item()
+    print(
+        f"\nMean difference between custom BN and built-in BN (should be very small): {diff:.6f}")
+
+    # ----------------------------------------------------------------
+    # Compare custom LayerNorm with built‑in LayerNorm
+    x_sample = torch.randn(10, 256).to(device)
+    ln_custom = LayerNormManual(256, eps=1e-5).to(device)
+    ln_builtin = nn.LayerNorm(
+        256, eps=1e-5, elementwise_affine=True).to(device)
+    # copy gamma/beta
+    with torch.no_grad():
+        ln_builtin.weight.copy_(ln_custom.gamma)
+        ln_builtin.bias.copy_(ln_custom.beta)
+
+    out_ln_custom = ln_custom(x_sample)
+    out_ln_builtin = ln_builtin(x_sample)
+    diff_ln = (out_ln_custom - out_ln_builtin).abs().mean().item()
+    print(f"Mean difference between custom LN and built‑in LN: {diff_ln:.6f}")
+
+    # ----------------------------------------------------------------
+    # Compare custom WeightNorm with built‑in weight_norm on a Linear layer
+    # e.g. same input dim as your NetWN
+    x_linear = torch.randn(10, 28*28).to(device)
+    wn_custom = LinearWeightNorm(28*28, 256).to(device)
+    # create a regular linear and wrap it
+    linear_built = nn.Linear(28*28, 256, bias=True).to(device)
+    linear_built = torch.nn.utils.weight_norm(linear_built, name='weight')
+
+    # copy v and g into built‑in weight_norm
+    with torch.no_grad():
+        # compute what custom wn layer’s weight would be
+        v = wn_custom.v            # shape [256, 784]
+        g = wn_custom.g.unsqueeze(1)            # shape [256]
+        v_norm = v.norm(dim=1, keepdim=True)        # [256,1]
+        w_cust = (g.unsqueeze(1) / v_norm) * v      # [256,784]
+        # now copy into built‑in
+        linear_built.weight_v.copy_(v)
+        linear_built.weight_g.copy_(g)
+        linear_built.bias.copy_(wn_custom.bias)
+
+    out_wn_custom = wn_custom(x_linear)
+    out_wn_builtin = linear_built(x_linear)
+    diff_wn = (out_wn_custom - out_wn_builtin).abs().mean().item()
+    print(f"Mean difference between custom WN and built‑in WN: {diff_wn:.6f}")
+
+    # Plotting
+    epochs_range = list(range(1, epochs+1))
+
+    # Training Loss
+    plt.figure()
+    for name in metrics:
+        plt.plot(epochs_range, metrics[name]['train_loss'], label=name)
+    plt.xlabel('Epoch')
+    plt.ylabel('Training Loss')
+    plt.title('Training Loss vs. Epoch')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+    # Test Accuracy
+    plt.figure()
+    for name in metrics:
+        plt.plot(epochs_range, [
+                 a*100 for a in metrics[name]['test_acc']], label=name)
+    plt.xlabel('Epoch')
+    plt.ylabel('Test Accuracy (%)')
+    plt.title('Test Accuracy vs. Epoch')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+
+
+if __name__ == '__main__':
+    main()
